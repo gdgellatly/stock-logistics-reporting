@@ -18,10 +18,10 @@
                     options="{'currency_field': 'cost_currency_id'}"
                 />
                 <button
-                    name="action_view_valuation_layers"
+                    name="action_view_valuation_moves"
                     type="object"
                     icon="fa-info-circle"
-                    title="View Valuation Layers"
+                    title="View Stock Moves"
                     invisible="valuation != 'real_time'"
                 />
                 <field
