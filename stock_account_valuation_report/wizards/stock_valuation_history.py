@@ -30,6 +30,6 @@ class StockValuationHistory(models.TransientModel):
         action["domain"] = domain
         if self.inventory_datetime:
             action_context = safe_eval(action["context"])
-            action_context["at_date"] = self.inventory_datetime
+            action_context["to_date"] = self.inventory_datetime
             action["context"] = action_context
         return action

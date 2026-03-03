@@ -66,9 +66,9 @@ Authors
 Contributors
 ------------
 
--  Jordi Ballester Alomar <jordi.ballester@forgeflow.com>
--  Aaron Henriquez <ahenriquez@forgeflow.com>
--  Stefan Rijnhart <stefan@opener.amsterdam>
+- Jordi Ballester Alomar <jordi.ballester@forgeflow.com>
+- Aaron Henriquez <ahenriquez@forgeflow.com>
+- Stefan Rijnhart <stefan@opener.amsterdam>
 
 Maintainers
 -----------

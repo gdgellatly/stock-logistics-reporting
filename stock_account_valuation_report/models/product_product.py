@@ -4,133 +4,190 @@
 
 
 from odoo import api, fields, models
-from odoo.tools import float_compare
+from odoo.tools import float_compare, float_is_zero
 
 
 class ProductProduct(models.Model):
     _inherit = "product.product"
 
-    stock_value = fields.Float("Inventory Value", compute="_compute_inventory_value")
-    account_value = fields.Float("Accounting Value", compute="_compute_inventory_value")
-    qty_at_date = fields.Float("Inventory Quantity", compute="_compute_inventory_value")
-    account_qty_at_date = fields.Float(
-        "Accounting Quantity", compute="_compute_inventory_value"
-    )
-    stock_fifo_real_time_aml_ids = fields.Many2many(
-        "account.move.line", compute="_compute_inventory_value"
-    )
-    stock_move_valuated_ids = fields.Many2many(
-        "stock.move", compute="_compute_inventory_value"
-    )
-    valuation_discrepancy = fields.Float(
+    account_value = fields.Monetary(
+        "Accounting Value",
         compute="_compute_inventory_value",
+        currency_field="company_currency_id",
+    )
+    qty_at_date = fields.Float(
+        "Inventory Quantity",
+        compute="_compute_inventory_value",
+        digits="Product Unit",
+    )
+    account_qty_at_date = fields.Float(
+        "Accounting Quantity",
+        compute="_compute_inventory_value",
+        digits="Product Unit",
+    )
+    valuation_discrepancy = fields.Monetary(
+        compute="_compute_inventory_value",
+        currency_field="company_currency_id",
         search="_search_valuation_discrepancy",
     )
     qty_discrepancy = fields.Float(
         compute="_compute_inventory_value",
         search="_search_qty_discrepancy",
+        digits="Product Unit",
     )
 
     @api.model
+    def _get_storable_products_with_moves(self):
+        """Storable products that have done stock moves.
+        Products outside this set can't have valuation discrepancies."""
+        to_date = self.env.context.get("to_date", False)
+        params = {"company_id": self.env.company.id}
+        date_clause = ""
+        if to_date:
+            date_clause = "AND sm.date <= %(to_date)s"
+            params["to_date"] = to_date
+        # pylint: disable=E8103
+        self.env.cr.execute(
+            f"""
+            SELECT DISTINCT sm.product_id
+            FROM stock_move sm
+            JOIN product_product pp ON pp.id = sm.product_id
+            JOIN product_template pt ON pt.id = pp.product_tmpl_id
+            WHERE sm.state = 'done'
+            AND sm.company_id = %(company_id)s
+            AND pt.is_storable = true
+            {date_clause}
+            """,
+            params,
+        )
+        product_ids = [r[0] for r in self.env.cr.fetchall()]
+        return self.with_context(active_test=False).browse(product_ids)
+
+    @api.model
+    def _get_valuation_account_ids(self):
+        """All stock valuation account IDs for the current company.
+
+        There are typically very few product categories, so loading all
+        is intentional and cheap.
+        """
+        categories = (
+            self.env["product.category"]
+            .with_context(active_test=False)
+            .search([("property_stock_valuation_account_id", "!=", False)])
+        )
+        account_ids = set(categories.mapped("property_stock_valuation_account_id").ids)
+        fallback = self.env.company.account_stock_valuation_id
+        if fallback:
+            account_ids.add(fallback.id)
+        return account_ids
+
+    @api.model
+    def _get_accounting_values_by_product(self, product_ids):
+        """Return {product_id: (balance, qty)} for valuation accounts via SQL."""
+        if not product_ids:
+            return {}
+        to_date = self.env.context.get("to_date", False)
+        company = self.env.company
+        valuation_account_ids = self._get_valuation_account_ids()
+        if not valuation_account_ids:
+            return {}
+        where_date = "AND aml.date <= %s" if to_date else ""
+        # pylint: disable=E8103
+        self.env.cr.execute(
+            f"""
+            SELECT aml.product_id,
+                sum(aml.balance),
+                sum(aml.quantity)
+            FROM account_move_line AS aml
+            WHERE aml.product_id IN %s
+            AND aml.account_id IN %s
+            AND aml.parent_state = 'posted'
+            AND aml.company_id = %s
+            {where_date}
+            GROUP BY aml.product_id
+            """,
+            (tuple(product_ids), tuple(valuation_account_ids), company.id)
+            + ((to_date,) if to_date else ()),
+        )
+        return {row[0]: (row[1], row[2]) for row in self.env.cr.fetchall()}
+
+    @api.model
     def _search_qty_discrepancy(self, operator, value):
-        products = self.with_context(active_test=False).search(
-            [("is_storable", "=", True)],
-        )
-        products_with_discrepancy = products.filtered(
-            lambda pp: float_compare(
-                pp.qty_at_date,
-                pp.account_qty_at_date,
-                precision_rounding=pp.uom_id.rounding,
-            )
-        )
-        return [("id", "in", products_with_discrepancy.ids)]
+        products = self._get_storable_products_with_moves()
+        if not products:
+            return [("id", "in", [])]
+        acct = self._get_accounting_values_by_product(products.ids)
+        products_valued = products._with_valuation_context()
+        qty_data = {p.id: p.qty_available for p in products_valued}
+        result_ids = []
+        for p in products:
+            if p.valuation != "real_time":
+                continue
+            _, acct_qty = acct.get(p.id, (0, 0))
+            stock_qty = qty_data.get(p.id, 0)
+            if float_compare(stock_qty, acct_qty, precision_rounding=p.uom_id.rounding):
+                result_ids.append(p.id)
+        return [("id", "in", result_ids)]
 
     @api.model
     def _search_valuation_discrepancy(self, operator, value):
-        products = self.with_context(active_test=False).search(
-            [("is_storable", "=", True)],
-        )
-        products_with_discrepancy = products.filtered(
-            lambda pp: self.env.company.currency_id.compare_amounts(
-                pp.stock_value, pp.account_value
-            )
-        )
-        return [("id", "in", products_with_discrepancy.ids)]
+        products = self._get_storable_products_with_moves()
+        if not products:
+            return [("id", "in", [])]
+        company = self.env.company
+        rounding = company.currency_id.rounding
+        acct = self._get_accounting_values_by_product(products.ids)
+        products_with_acct = {
+            pid
+            for pid, (balance, _) in acct.items()
+            if not float_is_zero(balance, precision_rounding=rounding)
+        }
+        products_valued = products._with_valuation_context()
+        qty_data = {}
+        products_with_stock = set()
+        for p in products_valued:
+            qty = p.qty_available
+            qty_data[p.id] = qty
+            if not p.uom_id.is_zero(qty):
+                products_with_stock.add(p.id)
+        candidate_ids = products_with_acct | products_with_stock
+        if not candidate_ids:
+            return [("id", "in", [])]
+        candidates = self.with_context(active_test=False).browse(candidate_ids)
+        result_ids = []
+        for p in candidates:
+            if p.valuation != "real_time":
+                continue
+            acct_val = acct.get(p.id, (0, 0))[0]
+            if p.cost_method == "fifo":
+                stock_val = p.total_value
+            else:
+                stock_val = qty_data.get(p.id, 0) * p.standard_price
+            if not float_is_zero(stock_val - acct_val, precision_rounding=rounding):
+                result_ids.append(p.id)
+        return [("id", "in", result_ids)]
 
     def _compute_inventory_value(self):
         self.env["account.move.line"].check_access("read")
-        to_date = self.env.context.get("at_date", False)
+        if not self:
+            return
+        acct = self._get_accounting_values_by_product(self.ids)
+        products_valued = self._with_valuation_context()
+        qty_data = {p.id: p.qty_available for p in products_valued}
 
-        # 1) ACCOUNTING VALUES
-        accounting_values = {}
-        # pylint: disable=E8103
-        query = """
-            SELECT aml.product_id, aml.account_id,
-                sum(aml.balance),
-                sum(CASE WHEN aml.balance < 0 THEN -aml.quantity ELSE aml.quantity END),
-                array_agg(aml.id)
-            FROM account_move_line AS aml
-            INNER JOIN account_move AS am ON am.id = aml.move_id
-            WHERE aml.product_id IN %s
-            AND am.state = 'posted'
-            AND aml.company_id=%s
-            {where_date_clause}
-            GROUP BY aml.product_id, aml.account_id
-        """
-
-        params = (tuple(self.ids), self.env.company.id)
-        where_date_clause = "AND aml.date <= %s" if to_date else ""
-        query = query.format(where_date_clause=where_date_clause)
-        if to_date:
-            params = params + (to_date,)
-        self.env.cr.execute(query, params=params)
-        for row in self.env.cr.fetchall():
-            accounting_values[(row[0], row[1])] = (row[2], row[3], list(row[4]))
-
-        # 2) INVENTORY VALUES
-        move_domain = [
-            ("product_id", "in", self.ids),
-            ("company_id", "=", self.env.company.id),
-            ("state", "=", "done"),
-        ]
-        if to_date:
-            move_domain.append(("date", "<=", to_date))
-
-        moves = self.env["stock.move"].search(move_domain)
-        move_values = {}
-        for move in moves:
-            if move.product_id.id not in move_values:
-                move_values[move.product_id.id] = {"qty": 0, "value": 0, "move_ids": []}
-            move_values[move.product_id.id]["qty"] += move.remaining_qty
-            move_values[move.product_id.id]["value"] += move.remaining_value
-            move_values[move.product_id.id]["move_ids"].append(move.id)
-        StockMove = self.env["stock.move"]
         for product in self:
             if product.valuation == "real_time":
-                valuation_account_id = (
-                    product.categ_id.property_stock_valuation_account_id.id
-                )
-                value, qty, aml_ids = accounting_values.get(
-                    (product.id, valuation_account_id)
-                ) or (0, 0, [])
+                value, qty = acct.get(product.id, (0, 0))
                 product.account_value = value
                 product.account_qty_at_date = qty
-                product.stock_fifo_real_time_aml_ids = self.env[
-                    "account.move.line"
-                ].browse(aml_ids)
             else:
                 product.account_value = 0
                 product.account_qty_at_date = 0
-                product.stock_fifo_real_time_aml_ids = []
-            move_data = move_values.get(product.id, {})
-            product.qty_at_date = move_data.get("qty", 0)
-            product.stock_value = move_data.get("value", 0)
-            product.stock_move_valuated_ids = StockMove.browse(
-                move_data.get("move_ids", [])
-            )
+
+            product.qty_at_date = qty_data.get(product.id, 0)
             if product.valuation == "real_time":
                 product.valuation_discrepancy = (
-                    product.stock_value - product.account_value
+                    product.total_value - product.account_value
                 )
                 product.qty_discrepancy = (
                     product.qty_at_date - product.account_qty_at_date
@@ -139,40 +196,53 @@ class ProductProduct(models.Model):
                 product.valuation_discrepancy = 0
                 product.qty_discrepancy = 0
 
+    def _get_move_domain(self):
+        self.ensure_one()
+        to_date = self.env.context.get("to_date", False)
+        domain = [
+            ("product_id", "=", self.id),
+            ("company_id", "=", self.env.company.id),
+            ("state", "=", "done"),
+        ]
+        if to_date:
+            domain.append(("date", "<=", to_date))
+        return domain
+
     def action_view_amls(self):
         self.ensure_one()
+        to_date = self.env.context.get("to_date", False)
+        valuation_account_id = self.categ_id.property_stock_valuation_account_id.id
+        domain = [
+            ("product_id", "=", self.id),
+            ("account_id", "=", valuation_account_id),
+            ("parent_state", "=", "posted"),
+            ("company_id", "=", self.env.company.id),
+        ]
+        if to_date:
+            domain.append(("date", "<=", to_date))
         list_view_ref = self.env.ref("account.view_move_line_tree")
         form_view_ref = self.env.ref("account.view_move_line_form")
-        action = {
+        return {
             "name": self.env._("Accounting Valuation at date"),
             "type": "ir.actions.act_window",
-            "view_type": "form",
             "view_mode": "list,form",
             "context": self.env.context,
             "res_model": "account.move.line",
-            "domain": [
-                (
-                    "id",
-                    "in",
-                    self.stock_fifo_real_time_aml_ids.ids,
-                )
-            ],
+            "domain": domain,
             "views": [(list_view_ref.id, "list"), (form_view_ref.id, "form")],
         }
-        return action
 
     def action_view_valuation_layers(self):
+        self.ensure_one()
         action = self.env["ir.actions.actions"]._for_xml_id(
             "stock_account.stock_valuation_layer_report_action"
         )
-        action["domain"] = [
-            ("id", "in", self.stock_move_valuated_ids.ids),
-        ]
+        action["domain"] = self._get_move_domain()
         action["context"] = {}
         return action
 
     def action_view_valuation_moves(self):
         self.ensure_one()
         action = self.env["ir.actions.actions"]._for_xml_id("stock.stock_move_action")
-        action["domain"] = [("id", "in", self.stock_move_valuated_ids.ids)]
+        action["domain"] = self._get_move_domain()
         return action
